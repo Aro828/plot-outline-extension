@@ -33,8 +33,9 @@ const defaultSettings = {
     apiModel: "claude-sonnet-4-6",
     maxTagsTotal: 10,
     maxMainTags: 2,
-    pacingMode: "manual", // "manual" | "dynamic"
+    pacingMode: "dynamic", // "manual" | "dynamic" —— 默认让AI自己判断节奏,这样最不容易生硬
     manualAffectionStep: 5,
+    actCount: 8, // 粗纲幕数,网文一般比传统小说的"起承转合"要拉长,默认给够
     characters: {}, // { charId: { mainTags: [], expTags: [], customTags: [], rules: [], values: {} } }
     outlines: {}, // { charId: { rough: [...], detailed: [...] } }
     tagLibrary: null, // 懒加载自 lib/*.json,可在运行时被用户扩充
@@ -105,8 +106,9 @@ function getCharProfile(charId) {
 function getOutlineStore(charId) {
     const settings = ensureSettings();
     if (!settings.outlines[charId]) {
-        settings.outlines[charId] = { rough: [], detailed: [] };
+        settings.outlines[charId] = { rough: [], detailed: [], meta: {} };
     }
+    if (!settings.outlines[charId].meta) settings.outlines[charId].meta = {};
     return settings.outlines[charId];
 }
 
@@ -378,6 +380,28 @@ async function inferCharacterTags(charId) {
 }
 
 // ---------- 大纲生成 ----------
+
+// 读取开场白(不同角色的开场白基调差异很大,决定了大纲的画风该冷峻还是甜宠)
+function getOpeningToneText() {
+    const char = getCurrentCharCard();
+    if (!char) return "";
+    return char.first_mes || (Array.isArray(char.data?.alternate_greetings) ? char.data.alternate_greetings[0] : "") || "";
+}
+
+// 读取最近的聊天记录(如果是中途开始用插件,大纲要接得上已经发生的剧情,不能当从零开始)
+function getRecentChatSummaryText(maxMessages = 12) {
+    try {
+        const context = getContext();
+        const chat = context.chat || [];
+        if (!chat.length) return "";
+        const recent = chat.slice(-maxMessages);
+        return recent.map(m => `${m.is_user ? "{{user}}" : (m.name || "角色")}: ${(m.mes || "").slice(0, 300)}`).join("\n");
+    } catch (err) {
+        console.warn("[爽文大纲助手] 读取聊天记录失败:", err);
+        return "";
+    }
+}
+
 function buildOutlineContextBlock(charId) {
     const profile = getCharProfile(charId);
     const settings = ensureSettings();
@@ -390,17 +414,32 @@ function buildOutlineContextBlock(charId) {
     ).join("\n");
     const pacingLine = settings.pacingMode === "manual"
         ? `情感推进: 手动模式,每个关键场景默认变化量为 ${settings.manualAffectionStep}`
-        : `情感推进: 动态模式,由AI根据当前场景张力自行判断增减幅度`;
+        : `情感推进: 动态模式——由你(AI)自己判断整个故事里数值该怎么涨跌最耐人寻味、最抓人,不必匀速,可以先抑后扬、可以中途大幅回落制造危机,只要最终走向合理。`;
 
-    return `${tagLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}`;
+    const openingTone = getOpeningToneText();
+    const openingLine = openingTone
+        ? `开场白基调参考(大纲的整体氛围要和这个基调一致,不要跑偏):\n${openingTone.slice(0, 600)}`
+        : "开场白: (未读取到)";
+
+    const recentChat = getRecentChatSummaryText();
+    const chatLine = recentChat
+        ? `最近的对话记录(如果这不是全新对话,大纲要衔接这里已经发生的剧情,不能无视既成事实重新开始):\n${recentChat}`
+        : "对话记录: (当前是全新对话,或还没有历史消息)";
+
+    return `${tagLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}\n\n${openingLine}\n\n${chatLine}`;
 }
 
 async function generateRoughOutline(charId, userBrief, selectedPlots, selectedShuangDian, selectedGenres, selectedEnding) {
     const contextBlock = buildOutlineContextBlock(charId);
-    const systemPrompt = `你是专业网络小说策划,擅长写"可执行大纲"。粗纲只需要给出骨架:分幕(3-6幕),每幕包含目标、核心转折、结尾状态。
-必须让人物的每一个关键行动都能用他的性格标签解释,不能只是为了推进情节而让人物行动。
-严格遵守人物规则句,不能写出违反规则的行为。
-只输出JSON数组,每个元素: {"act": 幕序号, "title": "幕标题", "goal": "目标", "turn": "核心转折", "endState": "结尾状态"}。不要输出其他文字。`;
+    const settings = ensureSettings();
+    const actCount = settings.actCount || 8;
+
+    const systemPrompt = `你是资深网络小说策划,深谙"开端-发展-高潮-结局"的经典网文结构和读者心理。
+粗纲只是骨架,分成${actCount}幕左右(允许±2幕的浮动,以故事需要为准),每幕只需要用简短的几句话说清楚:目标、核心转折、结尾状态——不要写细节,细节留给细纲阶段。
+人物的每一个关键行动都必须能用他的性格标签解释,不能是为了推进情节而让人物行动。
+整体节奏必须有张有弛:不能全程日常,也不能全程高强度冲突,压抑与释放要交替出现,前期埋的伏笔要在后面的幕里回收。
+严格遵守人物规则句,不能写出违反规则的行为。若提供了最近的对话记录,大纲要衔接已经发生的剧情,不能无视既成事实重新开始。
+只输出JSON数组,每个元素: {"act": 幕序号, "title": "幕标题", "goal": "目标(一句话)", "turn": "核心转折(一句话)", "endState": "结尾状态(一句话)"}。不要输出其他文字。`;
 
     const genreDefLines = (selectedGenres || []).filter(g => GENRE_DEFINITIONS[g]).map(g => `${g}: ${GENRE_DEFINITIONS[g]}`).join("\n");
 
@@ -420,11 +459,20 @@ async function generateRoughOutline(charId, userBrief, selectedPlots, selectedSh
     const store = getOutlineStore(charId);
     store.rough = parsed;
     store.detailed = [];
+    // 记住这次生成用的选项,细纲阶段(尤其是"一键生成完整细纲")复用,不用重新勾选
+    store.meta = { selectedPlots, selectedShuangDian, selectedGenres, selectedEnding, userBrief };
     saveSettingsDebounced();
     return parsed;
 }
 
-async function generateDetailedOutline(charId, actIndex) {
+function buildValueTrendLine(settings) {
+    if (settings.pacingMode === "manual") {
+        return `手动模式,每场景默认变化量${settings.manualAffectionStep}`;
+    }
+    return "动态模式——完全由你自己判断整部故事里数值该怎么起伏最抓人、最耐人寻味、最好读,不必匀速上涨,允许先抑后扬、允许中途大幅回落制造危机,只要最终走向和结局要求一致。";
+}
+
+async function generateDetailedOutline(charId, actIndex, priorForeshadows = []) {
     const store = getOutlineStore(charId);
     const act = store.rough[actIndex];
     if (!act) {
@@ -433,15 +481,24 @@ async function generateDetailedOutline(charId, actIndex) {
     }
     const contextBlock = buildOutlineContextBlock(charId);
     const settings = ensureSettings();
+    const meta = store.meta || {};
 
-    const systemPrompt = `你是专业网络小说策划。现在要把一幕粗纲展开成"细纲"——具体到每个场景/章节。
+    const genreDefLines = (meta.selectedGenres || []).filter(g => GENRE_DEFINITIONS[g]).map(g => `${g}: ${GENRE_DEFINITIONS[g]}`).join("\n");
+    const foreshadowLine = priorForeshadows.length
+        ? `前面幕里已经埋下、还没回收的伏笔(如果合适,在这一幕里回收至少一个):\n- ${priorForeshadows.join("\n- ")}`
+        : "";
+
+    const systemPrompt = `你是资深网络小说策划。现在要把一幕粗纲展开成"细纲"——具体到每个场景/章节,这是整个大纲里最重要的部分,必须写详细,不能敷衍。
 每个场景必须包含7个字段,不能省略:
-- goal(目标) - obstacle(阻碍) - action(人物具体行动,必须由其性格标签驱动)
-- result(结果/转折) - valueChange(数值变化,格式如"好感度+5"或"好感度: AI动态判断") - foreshadow(伏笔埋下或回收) - hook(结尾钩子)
-情感推进模式为: ${settings.pacingMode === "manual" ? `手动,每场景默认变化量${settings.manualAffectionStep}` : "动态,由你判断"}
+- goal(目标) - obstacle(阻碍) - action(人物具体行动,必须由其性格标签驱动,不是为了情节而行动)
+- result(结果/转折) - valueChange(数值变化,格式如"好感度+5"或直接写"好感度: 具体判断理由") - foreshadow(这个场景埋下的新伏笔,或回收了哪个旧伏笔,写清楚是"埋"还是"收") - hook(结尾钩子/爽点落点)
+情感数值节奏: ${buildValueTrendLine(settings)}
+体裁要求: ${meta.selectedGenres?.join("、") || "(未指定)"}${genreDefLines ? `\n体裁定义(严格按此理解):\n${genreDefLines}` : ""}
+${foreshadowLine}
+这一幕内部的节奏也要有张弛(不能从头到尾都是同一种强度),按20种经典情节类型(${meta.selectedPlots?.join("、") || "不限"})的骨架来组织事件,但人物的具体反应必须由性格标签决定,同样的情节骨架配不同性格的人物应该演出不同的戏。
 只输出JSON数组,每个元素包含上述7个字段加"scene"(场景序号)。不要输出其他文字。`;
 
-    const userPrompt = `人物档案:\n${contextBlock}\n\n当前幕: ${act.title}\n目标: ${act.goal}\n核心转折: ${act.turn}\n结尾状态: ${act.endState}\n\n请把这一幕拆成4-8个场景的细纲。`;
+    const userPrompt = `人物档案:\n${contextBlock}\n\n当前幕: ${act.title}\n目标: ${act.goal}\n核心转折: ${act.turn}\n结尾状态: ${act.endState}\n\n请把这一幕拆成4-8个场景的细纲,场景之间要有起伏,不要匀速平铺直叙。`;
 
     const raw = await callIndependentApi(userPrompt, systemPrompt);
     let parsed;
@@ -460,15 +517,62 @@ async function generateDetailedOutline(charId, actIndex) {
     return parsed;
 }
 
-function injectOutlineIntoContext(charId) {
-    const context = getContext();
+// 一键把所有幕的细纲依次生成完(不用一幕一幕点),后面的幕会知道前面埋了什么伏笔,方便回收
+async function generateFullDetailedOutline(charId, onProgress) {
     const store = getOutlineStore(charId);
     if (!store.rough.length) {
-        toastr.warning("还没有大纲可以注入,先生成粗纲。");
-        return;
+        toastr.error("还没有粗纲,先生成粗纲。");
+        return null;
     }
+    const collectedForeshadows = [];
+    for (let i = 0; i < store.rough.length; i++) {
+        onProgress?.(i + 1, store.rough.length);
+        const scenes = await generateDetailedOutline(charId, i, collectedForeshadows);
+        if (!scenes) return null; // 某一幕失败就停下,已生成的部分保留
+        for (const s of scenes) {
+            if (s.foreshadow && /埋|新增|种下/.test(s.foreshadow)) {
+                collectedForeshadows.push(s.foreshadow);
+            }
+        }
+    }
+    return store.detailed;
+}
 
-    const summary = store.rough.map(a => `【${a.title}】目标:${a.goal} 转折:${a.turn}`).join("\n");
+function clearOutline(charId) {
+    const settings = ensureSettings();
+    settings.outlines[charId] = { rough: [], detailed: [], meta: {} };
+    saveSettingsDebounced();
+}
+
+function deleteRoughAct(charId, idx) {
+    const store = getOutlineStore(charId);
+    store.rough.splice(idx, 1);
+    if (store.detailed) store.detailed.splice(idx, 1);
+    saveSettingsDebounced();
+}
+
+function deleteDetailedScene(charId, actIdx, sceneIdx) {
+    const store = getOutlineStore(charId);
+    if (store.detailed?.[actIdx]) {
+        store.detailed[actIdx].splice(sceneIdx, 1);
+        saveSettingsDebounced();
+    }
+}
+
+// 构造要注入对话上下文的摘要文本(供"注入"和"预览/复制"两处共用,保证所见即所注入)
+function buildInjectionSummaryText(charId) {
+    const store = getOutlineStore(charId);
+    if (!store.rough.length) return "";
+    return store.rough.map(a => `【${a.title}】目标:${a.goal} 转折:${a.turn}`).join("\n");
+}
+
+function injectOutlineIntoContext(charId) {
+    const context = getContext();
+    const summary = buildInjectionSummaryText(charId);
+    if (!summary) {
+        toastr.warning("还没有大纲可以注入,先生成粗纲。");
+        return false;
+    }
     try {
         context.setExtensionPrompt(
             "PLOT_OUTLINE_ASSISTANT",
@@ -478,9 +582,11 @@ function injectOutlineIntoContext(charId) {
             false,
             0
         );
+        return true;
     } catch (err) {
         console.warn("[爽文大纲助手] 注入上下文失败(可能是ST版本API差异):", err);
         toastr.error("注入失败,可能是酒馆版本API差异,请截图控制台报错反馈。");
+        return false;
     }
 }
 
@@ -521,11 +627,12 @@ function renderDetailedTable(scenes, actIdx) {
             <td class="poa-editable" contenteditable="true" data-field="valueChange" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.valueChange)}</td>
             <td class="poa-editable" contenteditable="true" data-field="foreshadow" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.foreshadow)}</td>
             <td class="poa-editable" contenteditable="true" data-field="hook" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.hook)}</td>
+            <td><span class="poa-delete-scene" data-act="${actIdx}" data-scene="${i}" title="删除这一场景">🗑</span></td>
         </tr>
     `).join("");
     return `
         <table class="poa-detail-table">
-            <thead><tr><th>#</th><th>目标</th><th>阻碍</th><th>行动</th><th>结果</th><th>数值变化</th><th>伏笔</th><th>钩子</th></tr></thead>
+            <thead><tr><th>#</th><th>目标</th><th>阻碍</th><th>行动</th><th>结果</th><th>数值变化</th><th>伏笔</th><th>钩子</th><th></th></tr></thead>
             <tbody>${rows}</tbody>
         </table>
     `;
@@ -545,7 +652,10 @@ async function renderPopupInner() {
         <div class="poa-rough-node" data-idx="${i}">
             <div class="poa-rough-head">
                 <b>第${a.act}幕: <span class="poa-editable" contenteditable="true" data-field="title" data-idx="${i}">${escapeHtml(a.title)}</span></b>
-                <button class="menu_button poa-gen-detail" data-idx="${i}">展开细纲</button>
+                <span>
+                    <button class="menu_button poa-gen-detail" data-idx="${i}">展开/重生成细纲</button>
+                    <button class="menu_button poa-delete-act" data-idx="${i}" title="删除这一幕">🗑</button>
+                </span>
             </div>
             <div>目标: <span class="poa-editable" contenteditable="true" data-field="goal" data-idx="${i}">${escapeHtml(a.goal)}</span></div>
             <div>转折: <span class="poa-editable" contenteditable="true" data-field="turn" data-idx="${i}">${escapeHtml(a.turn)}</span></div>
@@ -606,19 +716,28 @@ async function renderPopupInner() {
 
         <div class="poa-tab-panel" data-panel="outline" style="display:none">
             <div class="poa-field">
-                <label>剧情构想/要求(粗纲生成依据)</label>
+                <label>剧情构想/要求(粗纲生成依据,留空则AI基于人物档案+开场白+聊天记录自由发挥)</label>
                 <textarea id="poa-outline-brief" class="text_pole" rows="3" placeholder="描述你想要的剧情方向,留空则AI自由发挥"></textarea>
+            </div>
+            <div class="poa-field">
+                <label>幕数(粗纲分几幕,网文建议6-10)</label>
+                <input type="number" id="poa-act-count" class="text_pole" style="width:80px" value="${settings.actCount}" min="3" max="20">
             </div>
             <div class="poa-field">
                 <label>情感推进节奏</label>
                 <select id="poa-pacing-mode" class="text_pole">
+                    <option value="dynamic" ${settings.pacingMode === "dynamic" ? "selected" : ""}>AI动态判断(推荐,自动找最抓人的起伏节奏)</option>
                     <option value="manual" ${settings.pacingMode === "manual" ? "selected" : ""}>手动固定增量</option>
-                    <option value="dynamic" ${settings.pacingMode === "dynamic" ? "selected" : ""}>AI动态判断</option>
                 </select>
                 <input type="number" id="poa-manual-step" class="text_pole" style="width:80px" value="${settings.manualAffectionStep}" ${settings.pacingMode !== "manual" ? "disabled" : ""}>
             </div>
-            <button class="menu_button" id="poa-gen-rough">生成粗纲</button>
+            <button class="menu_button" id="poa-gen-rough">① 生成粗纲</button>
+            <button class="menu_button" id="poa-gen-full-detail">② 一键生成完整细纲(所有幕)</button>
             <button class="menu_button" id="poa-inject-outline">注入到对话上下文</button>
+            <button class="menu_button" id="poa-preview-inject">预览/复制注入内容</button>
+            <button class="menu_button" id="poa-clear-outline" style="background:#a33">清空大纲</button>
+            <div id="poa-inject-preview" class="poa-muted" style="white-space:pre-wrap;margin-top:6px"></div>
+            <div id="poa-gen-progress" class="poa-muted"></div>
             <div id="poa-rough-container">${roughRows}</div>
         </div>
 
@@ -871,6 +990,8 @@ function setupGlobalDelegation() {
         if (e.target.id === "poa-gen-rough") {
             const popup = e.target.closest("#poa-popup");
             const brief = popup.querySelector("#poa-outline-brief")?.value || "";
+            const actCountInput = parseInt(popup.querySelector("#poa-act-count")?.value, 10);
+            if (actCountInput) { ensureSettings().actCount = actCountInput; saveSettingsDebounced(); }
             const getSelected = (gridId) => Array.from(popup.querySelectorAll(`#${gridId} .poa-toggle-btn.selected`)).map(b => b.dataset.value);
             const selectedPlots = getSelected("poa-plot-toggle");
             const selectedShuang = getSelected("poa-shuang-toggle");
@@ -891,18 +1012,83 @@ function setupGlobalDelegation() {
             return;
         }
 
-        // 注入大纲到上下文
-        if (e.target.id === "poa-inject-outline") {
-            injectOutlineIntoContext(charId);
-            toastr.success("已注入到对话上下文");
+        // 一键生成完整细纲(所有幕依次生成,后面的幕能感知前面埋的伏笔)
+        if (e.target.id === "poa-gen-full-detail") {
+            const popup = e.target.closest("#poa-popup");
+            const progressEl = popup.querySelector("#poa-gen-progress");
+            toastr.info("正在生成完整细纲,幕数多的话会花一点时间...");
+            try {
+                await generateFullDetailedOutline(charId, (cur, total) => {
+                    if (progressEl) progressEl.textContent = `正在生成第 ${cur}/${total} 幕的细纲...`;
+                });
+                if (progressEl) progressEl.textContent = "";
+                toastr.success("完整细纲生成完成");
+                await refreshPopup();
+            } catch (err) {
+                console.error(err);
+                toastr.error("生成失败: " + err.message);
+            }
             return;
         }
 
-        // 展开细纲
+        // 注入大纲到上下文
+        if (e.target.id === "poa-inject-outline") {
+            const ok = injectOutlineIntoContext(charId);
+            if (ok) toastr.success("已注入到对话上下文(可以点旁边'预览/复制'确认具体内容)");
+            return;
+        }
+
+        // 预览/复制即将注入的内容(所见即所注入,方便确认是否真的生效,以及手动粘贴到作者注释兜底)
+        if (e.target.id === "poa-preview-inject") {
+            const popup = e.target.closest("#poa-popup");
+            const text = buildInjectionSummaryText(charId);
+            const previewEl = popup.querySelector("#poa-inject-preview");
+            if (!text) {
+                if (previewEl) previewEl.textContent = "还没有大纲,先生成粗纲。";
+                return;
+            }
+            if (previewEl) previewEl.textContent = text;
+            navigator.clipboard?.writeText(text).then(() => {
+                toastr.success("已复制到剪贴板,可以手动粘贴到作者注释/世界书里兜底");
+            }).catch(() => {
+                toastr.info("内容已显示在下方,手动复制即可(自动复制到剪贴板失败)");
+            });
+            return;
+        }
+
+        // 清空大纲
+        if (e.target.id === "poa-clear-outline") {
+            if (!window.confirm("确定要清空当前角色的整个大纲(粗纲+细纲)吗?这个操作无法撤销。")) return;
+            clearOutline(charId);
+            toastr.success("大纲已清空");
+            await refreshPopup();
+            return;
+        }
+
+        // 删除某一幕
+        const deleteActBtn = e.target.closest(".poa-delete-act");
+        if (deleteActBtn) {
+            const idx = parseInt(deleteActBtn.dataset.idx, 10);
+            deleteRoughAct(charId, idx);
+            await refreshPopup();
+            return;
+        }
+
+        // 删除细纲里的某个场景
+        const deleteSceneBtn = e.target.closest(".poa-delete-scene");
+        if (deleteSceneBtn) {
+            const actIdx = parseInt(deleteSceneBtn.dataset.act, 10);
+            const sceneIdx = parseInt(deleteSceneBtn.dataset.scene, 10);
+            deleteDetailedScene(charId, actIdx, sceneIdx);
+            await refreshPopup();
+            return;
+        }
+
+        // 展开细纲(单独重新生成某一幕)
         const detailBtn = e.target.closest(".poa-gen-detail");
         if (detailBtn) {
             const idx = parseInt(detailBtn.dataset.idx, 10);
-            toastr.info("正在展开细纲...");
+            toastr.info("正在生成这一幕的细纲...");
             try {
                 const result = await generateDetailedOutline(charId, idx);
                 if (result) {
@@ -1013,6 +1199,12 @@ function setupGlobalDelegation() {
             return;
         }
 
+        if (e.target.id === "poa-act-count") {
+            settings.actCount = parseInt(e.target.value, 10) || 8;
+            saveSettingsDebounced();
+            return;
+        }
+
         if (e.target.id === "poa-api-provider") {
             settings.apiProvider = e.target.value;
             saveSettingsDebounced();
@@ -1111,6 +1303,38 @@ jQuery(async () => {
 
     if (ensureSettings().floatingWindow) {
         toggleFloatingWindow(true);
+    }
+
+    // 新对话检测:切换/新建对话时,如果当前角色已经有大纲内容,弹窗问是否保留。
+    // 用动态import,万一这个酒馆版本导出方式不一样,失败了也只是这一个小功能不生效,
+    // 不会拖累整个扩展加载失败。
+    try {
+        const scriptModule = await import("../../../../script.js");
+        const { eventSource, event_types } = scriptModule;
+        if (eventSource && event_types?.CHAT_CHANGED) {
+            let lastChatKey = null;
+            eventSource.on(event_types.CHAT_CHANGED, () => {
+                const charId = getCurrentCharId();
+                const chatId = getContext().chatId;
+                const key = `${charId}::${chatId}`;
+                if (key === lastChatKey) return;
+                lastChatKey = key;
+                const store = getOutlineStore(charId);
+                if (store.rough?.length) {
+                    setTimeout(() => {
+                        const keep = window.confirm(
+                            `检测到「${getCurrentCharCard()?.name || "当前角色"}」已有大纲内容。\n\n点"确定"保留现有大纲,点"取消"清空后重新开始。`
+                        );
+                        if (!keep) {
+                            clearOutline(charId);
+                            toastr.info("已清空该角色的大纲");
+                        }
+                    }, 300);
+                }
+            });
+        }
+    } catch (err) {
+        console.warn("[爽文大纲助手] 新对话检测功能加载失败(不影响其他功能):", err);
     }
 
     console.log("[爽文大纲助手] 扩展已加载(事件委托版)");

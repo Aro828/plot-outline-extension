@@ -98,6 +98,15 @@
     border-color: var(--SmartThemeQuoteColor, #5a67d8);
 }
 
+.poa-delete-scene {
+    cursor: pointer;
+    opacity: 0.7;
+}
+
+.poa-delete-scene:hover {
+    opacity: 1;
+}
+
 .poa-check {
     font-size: 0.9em;
 }
