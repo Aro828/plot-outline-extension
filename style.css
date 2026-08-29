@@ -1,6 +1,10 @@
 #poa-popup {
     max-width: 100%;
     font-size: 0.95em;
+    max-height: 65vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-right: 2px;
 }
 
 .poa-tabs {
@@ -71,6 +75,29 @@
     gap: 4px;
 }
 
+.poa-toggle-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.poa-toggle-btn {
+    display: inline-block;
+    padding: 5px 12px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 16px;
+    cursor: pointer;
+    font-size: 0.88em;
+    user-select: none;
+    transition: background 0.15s, color 0.15s;
+}
+
+.poa-toggle-btn.selected {
+    background: var(--SmartThemeQuoteColor, #5a67d8);
+    color: #fff;
+    border-color: var(--SmartThemeQuoteColor, #5a67d8);
+}
+
 .poa-check {
     font-size: 0.9em;
 }
@@ -130,16 +157,44 @@
 
 #poa-floating-window {
     position: fixed;
-    top: 80px;
-    left: 80px;
-    width: 420px;
-    max-height: 70vh;
-    overflow: auto;
+    top: 100px;
+    right: 16px;
+    z-index: 9998;
+    transition: width 0.15s, height 0.15s;
+}
+
+#poa-floating-window.collapsed {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #ff9a76, #ff6b9d);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    cursor: pointer;
+}
+
+#poa-floating-icon {
+    font-size: 26px;
+    line-height: 1;
+    pointer-events: none; /* 点击判定交给外层容器,避免emoji自身吃掉事件目标 */
+}
+
+#poa-floating-window.expanded {
+    width: min(92vw, 420px);
+    max-height: 75vh;
     background: var(--SmartThemeBlurTintColor, #222);
     border: 1px solid var(--SmartThemeBorderColor, #555);
     border-radius: 10px;
-    z-index: 9998;
     box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    overflow: hidden;
+}
+
+#poa-floating-panel {
+    display: flex;
+    flex-direction: column;
+    max-height: 75vh;
 }
 
 #poa-floating-header {
@@ -150,12 +205,15 @@
     border-radius: 10px 10px 0 0;
     display: flex;
     justify-content: space-between;
+    flex-shrink: 0;
 }
 
 #poa-floating-close {
     cursor: pointer;
 }
 
-#poa-floating-body {
+#poa-floating-panel #poa-popup {
     padding: 10px;
+    max-height: none; /* 高度交给 #poa-floating-panel 控制,避免双重滚动条 */
+    flex: 1;
 }

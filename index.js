@@ -38,6 +38,7 @@ const defaultSettings = {
     characters: {}, // { charId: { mainTags: [], expTags: [], customTags: [], rules: [], values: {} } }
     outlines: {}, // { charId: { rough: [...], detailed: [...] } }
     tagLibrary: null, // 懒加载自 lib/*.json,可在运行时被用户扩充
+    customShuangDian: [], // 用户自定义爽点,持久保存,跨角色可复用
 };
 
 function ensureSettings() {
@@ -305,7 +306,42 @@ async function callIndependentApi(prompt, systemPrompt = "") {
     }
 }
 
-// ---------- 人物标签推断(调用独立API) ----------
+// 拉取当前API提供方支持的模型列表(供设置页"拉取模型"按钮使用)
+async function fetchAvailableModels() {
+    const settings = ensureSettings();
+    if (!settings.apiKey) {
+        toastr.error("请先填写API Key再拉取模型列表。");
+        return [];
+    }
+    if (settings.apiProvider === "claude") {
+        const res = await fetch("https://api.anthropic.com/v1/models", {
+            headers: {
+                "x-api-key": settings.apiKey,
+                "anthropic-version": "2023-06-01",
+                "anthropic-dangerous-direct-browser-access": "true",
+            },
+        });
+        if (!res.ok) throw new Error(`拉取模型失败 ${res.status}: ${await res.text()}`);
+        const data = await res.json();
+        return (data.data || []).map(m => m.id);
+    } else {
+        const base = settings.apiBaseUrl || "https://api.openai.com/v1";
+        const res = await fetch(`${base}/models`, {
+            headers: { "Authorization": `Bearer ${settings.apiKey}` },
+        });
+        if (!res.ok) throw new Error(`拉取模型失败 ${res.status}: ${await res.text()}`);
+        const data = await res.json();
+        return (data.data || []).map(m => m.id);
+    }
+}
+
+// ---------- 故事体裁 / 结局 标签定义(生成大纲时会把选中标签的具体定义喂给AI,避免AI按字面猜) ----------
+const GENRE_TAGS = ["正剧", "悲剧", "喜剧", "甜剧", "狗血", "雷文", "酸涩"];
+const GENRE_DEFINITIONS = {
+    "雷文": "人物不忠诚、善变,只在意当下不考虑后果,可能出现NTR式背叛,会做出让user完全意想不到、直接伤害user感情的行为。",
+    "酸涩": "程度比狗血浅,重点描写感情关系中处于弱势/单方付出一方的心理活动,常伴随阴差阳错的巧合。",
+};
+const ENDING_TAGS = ["HE", "BE", "OE", "TE"];
 async function inferCharacterTags(charId) {
     const char = getCurrentCharCard();
     if (!char) return null;
@@ -359,14 +395,16 @@ function buildOutlineContextBlock(charId) {
     return `${tagLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}`;
 }
 
-async function generateRoughOutline(charId, userBrief, selectedPlots, selectedShuangDian) {
+async function generateRoughOutline(charId, userBrief, selectedPlots, selectedShuangDian, selectedGenres, selectedEnding) {
     const contextBlock = buildOutlineContextBlock(charId);
     const systemPrompt = `你是专业网络小说策划,擅长写"可执行大纲"。粗纲只需要给出骨架:分幕(3-6幕),每幕包含目标、核心转折、结尾状态。
 必须让人物的每一个关键行动都能用他的性格标签解释,不能只是为了推进情节而让人物行动。
 严格遵守人物规则句,不能写出违反规则的行为。
 只输出JSON数组,每个元素: {"act": 幕序号, "title": "幕标题", "goal": "目标", "turn": "核心转折", "endState": "结尾状态"}。不要输出其他文字。`;
 
-    const userPrompt = `人物档案:\n${contextBlock}\n\n情节类型: ${selectedPlots.join("、") || "(未指定,你可自行判断)"}\n爽点要求: ${selectedShuangDian.join("、") || "(未指定)"}\n\n用户的剧情构想/要求:\n${userBrief || "(无特别要求,请基于人物档案自由发挥)"}`;
+    const genreDefLines = (selectedGenres || []).filter(g => GENRE_DEFINITIONS[g]).map(g => `${g}: ${GENRE_DEFINITIONS[g]}`).join("\n");
+
+    const userPrompt = `人物档案:\n${contextBlock}\n\n情节类型: ${selectedPlots.join("、") || "(未指定,你可自行判断)"}\n爽点要求: ${selectedShuangDian.join("、") || "(未指定)"}\n故事体裁: ${selectedGenres?.join("、") || "(未指定)"}${genreDefLines ? `\n体裁定义(严格按此理解,不要按字面猜):\n${genreDefLines}` : ""}\n结局要求: ${selectedEnding || "(未指定)"}\n\n用户的剧情构想/要求:\n${userBrief || "(无特别要求,请基于人物档案自由发挥)"}`;
 
     const raw = await callIndependentApi(userPrompt, systemPrompt);
     let parsed;
@@ -457,6 +495,14 @@ function renderTagChips(tags, removable) {
     `).join("");
 }
 
+// 按钮式多选/单选标签网格。mode="multi"(默认,无限多选) 或 "single"(单选,选一个自动取消其他)
+function renderToggleGrid(groupId, options, mode = "multi") {
+    const buttons = options.map(opt =>
+        `<span class="poa-toggle-btn" data-value="${escapeHtml(opt)}">${escapeHtml(opt)}</span>`
+    ).join("");
+    return `<div class="poa-toggle-grid" id="${groupId}" data-mode="${mode}">${buttons}</div>`;
+}
+
 function escapeHtml(str) {
     return String(str ?? "").replace(/[&<>"']/g, c => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -492,10 +538,8 @@ async function renderPopupInner() {
     const settings = ensureSettings();
     const lib = await loadTagLibrary();
 
-    const plotOptions = lib.plots.plots.concat(lib.plots.custom_plots || [])
-        .map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join("");
-    const shuangOptions = lib.shuangDian.shuang_dian.concat(lib.shuangDian.custom_shuang_dian || [])
-        .map(s => `<label class="poa-check"><input type="checkbox" value="${escapeHtml(s.name)}" class="poa-shuang-cb"> ${escapeHtml(s.name)}</label>`).join("");
+    const plotNames = lib.plots.plots.concat(lib.plots.custom_plots || []).map(p => p.name);
+    const shuangNames = lib.shuangDian.shuang_dian.concat(lib.shuangDian.custom_shuang_dian || []).map(s => s.name).concat(settings.customShuangDian || []);
 
     const roughRows = store.rough.map((a, i) => `
         <div class="poa-rough-node" data-idx="${i}">
@@ -550,8 +594,14 @@ async function renderPopupInner() {
         </div>
 
         <div class="poa-tab-panel" data-panel="plot" style="display:none">
-            <div class="poa-field"><label>情节类型(可多选)</label><select id="poa-plot-select" multiple size="6">${plotOptions}</select></div>
-            <div class="poa-field"><label>爽点勾选</label><div class="poa-shuang-grid">${shuangOptions}</div></div>
+            <div class="poa-field"><label>情节类型(可多选)</label>${renderToggleGrid("poa-plot-toggle", plotNames, "multi")}</div>
+            <div class="poa-field"><label>故事体裁(可多选)</label>${renderToggleGrid("poa-genre-toggle", GENRE_TAGS, "multi")}</div>
+            <div class="poa-field"><label>结局(单选)</label>${renderToggleGrid("poa-ending-toggle", ENDING_TAGS, "single")}</div>
+            <div class="poa-field">
+                <label>爽点(可多选,可无限自定义)</label>
+                ${renderToggleGrid("poa-shuang-toggle", shuangNames, "multi")}
+                <input type="text" id="poa-add-shuangdian-input" placeholder="＋ 输入新爽点后回车添加" class="text_pole" style="margin-top:6px">
+            </div>
         </div>
 
         <div class="poa-tab-panel" data-panel="outline" style="display:none">
@@ -583,7 +633,12 @@ async function renderPopupInner() {
             <div class="poa-field poa-openai-only" style="${settings.apiProvider === "openai_compatible" ? "" : "display:none"}">
                 <label>Base URL(OpenAI兼容接口用)</label><input type="text" id="poa-api-base" class="text_pole" value="${escapeHtml(settings.apiBaseUrl)}" placeholder="https://api.deepseek.com/v1">
             </div>
-            <div class="poa-field"><label>模型名</label><input type="text" id="poa-api-model" class="text_pole" value="${escapeHtml(settings.apiModel)}"></div>
+            <div class="poa-field">
+                <label>模型名</label>
+                <input type="text" id="poa-api-model" class="text_pole" value="${escapeHtml(settings.apiModel)}">
+                <button class="menu_button" id="poa-fetch-models">拉取模型列表</button>
+                <div id="poa-model-list-container"></div>
+            </div>
             <div class="poa-field"><label><input type="checkbox" id="poa-floating-toggle" ${settings.floatingWindow ? "checked" : ""}> 启用悬浮窗</label></div>
         </div>
     `;
@@ -602,50 +657,98 @@ async function refreshPopup() {
 
 let floatingWindowEl = null;
 
+// 悬浮窗默认是个小圆图标(折叠态),点一下展开成完整面板,再点一下收回去。
+// dragMoved 用来区分"拖动"和"点击"——拖动过就不触发展开/收起。
 function toggleFloatingWindow(show) {
     if (show) {
         if (floatingWindowEl) return;
         floatingWindowEl = document.createElement("div");
         floatingWindowEl.id = "poa-floating-window";
+        floatingWindowEl.className = "collapsed";
         floatingWindowEl.innerHTML = `
-            <div id="poa-floating-header">爽文大纲助手 <span id="poa-floating-close">×</span></div>
-            <div id="poa-popup"></div>
+            <div id="poa-floating-icon">🔮</div>
+            <div id="poa-floating-panel" style="display:none">
+                <div id="poa-floating-header">爽文大纲助手 <span id="poa-floating-close">─</span></div>
+                <div id="poa-popup"></div>
+            </div>
         `;
         document.body.appendChild(floatingWindowEl);
-        refreshPopup();
-        makeDraggable(floatingWindowEl, floatingWindowEl.querySelector("#poa-floating-header"));
+        makeDraggable(floatingWindowEl, floatingWindowEl);
     } else {
         floatingWindowEl?.remove();
         floatingWindowEl = null;
     }
 }
 
+function expandFloatingWindow() {
+    if (!floatingWindowEl) return;
+    floatingWindowEl.classList.remove("collapsed");
+    floatingWindowEl.classList.add("expanded");
+    floatingWindowEl.querySelector("#poa-floating-icon").style.display = "none";
+    floatingWindowEl.querySelector("#poa-floating-panel").style.display = "";
+    refreshPopup();
+}
+
+function collapseFloatingWindow() {
+    if (!floatingWindowEl) return;
+    floatingWindowEl.classList.remove("expanded");
+    floatingWindowEl.classList.add("collapsed");
+    floatingWindowEl.querySelector("#poa-floating-icon").style.display = "";
+    floatingWindowEl.querySelector("#poa-floating-panel").style.display = "none";
+}
+
 function makeDraggable(el, handle) {
-    let offsetX = 0, offsetY = 0, dragging = false;
-    handle.addEventListener("mousedown", (e) => {
+    let offsetX = 0, offsetY = 0, dragging = false, startX = 0, startY = 0, moved = false;
+    const DRAG_THRESHOLD = 6; // 移动超过这个像素才算"拖动",否则算"点击"
+
+    // 只有点在图标(折叠态)或标题栏(展开态)上才允许发起拖动,
+    // 避免和展开面板内部的滚动/按钮点击冲突。
+    function isDragHandle(target) {
+        return !!(target.closest("#poa-floating-icon") || target.closest("#poa-floating-header"));
+    }
+
+    function onDragStart(clientX, clientY, target) {
+        if (!isDragHandle(target)) return;
         dragging = true;
-        offsetX = e.clientX - el.offsetLeft;
-        offsetY = e.clientY - el.offsetTop;
-    });
+        moved = false;
+        startX = clientX;
+        startY = clientY;
+        offsetX = clientX - el.offsetLeft;
+        offsetY = clientY - el.offsetTop;
+    }
+    function onDragMove(clientX, clientY) {
+        if (!dragging) return;
+        if (Math.abs(clientX - startX) > DRAG_THRESHOLD || Math.abs(clientY - startY) > DRAG_THRESHOLD) {
+            moved = true;
+        }
+        el.style.left = `${clientX - offsetX}px`;
+        el.style.top = `${clientY - offsetY}px`;
+        el.style.right = "auto";
+    }
+    function onDragEnd(target) {
+        if (!dragging) return;
+        dragging = false;
+        // 没有真的拖动 = 视为点击:折叠态点图标展开,展开态点收起按钮收回
+        if (!moved) {
+            if (target?.id === "poa-floating-icon" || target?.closest?.("#poa-floating-icon")) {
+                expandFloatingWindow();
+            } else if (target?.id === "poa-floating-close" || target?.closest?.("#poa-floating-close")) {
+                collapseFloatingWindow();
+            }
+        }
+    }
+
+    handle.addEventListener("mousedown", (e) => onDragStart(e.clientX, e.clientY, e.target));
     handle.addEventListener("touchstart", (e) => {
-        dragging = true;
         const t = e.touches[0];
-        offsetX = t.clientX - el.offsetLeft;
-        offsetY = t.clientY - el.offsetTop;
+        onDragStart(t.clientX, t.clientY, e.target);
     }, { passive: true });
-    document.addEventListener("mousemove", (e) => {
-        if (!dragging) return;
-        el.style.left = `${e.clientX - offsetX}px`;
-        el.style.top = `${e.clientY - offsetY}px`;
-    });
-    document.addEventListener("touchmove", (e) => {
-        if (!dragging) return;
-        const t = e.touches[0];
-        el.style.left = `${t.clientX - offsetX}px`;
-        el.style.top = `${t.clientY - offsetY}px`;
-    }, { passive: true });
-    document.addEventListener("mouseup", () => { dragging = false; });
-    document.addEventListener("touchend", () => { dragging = false; });
+
+    document.addEventListener("mousemove", (e) => onDragMove(e.clientX, e.clientY));
+    document.addEventListener("touchmove", (e) => onDragMove(e.touches[0]?.clientX, e.touches[0]?.clientY), { passive: true });
+
+    document.addEventListener("mouseup", (e) => onDragEnd(e.target));
+    document.addEventListener("touchend", (e) => onDragEnd(e.changedTouches[0] ? document.elementFromPoint(e.changedTouches[0].clientX, e.changedTouches[0].clientY) : null));
 }
 
 async function openMainPopup() {
@@ -724,6 +827,19 @@ function setupGlobalDelegation() {
             return;
         }
 
+        // 按钮式标签选择(情节类型/故事体裁/结局/爽点 通用)
+        const toggleBtn = e.target.closest(".poa-toggle-btn");
+        if (toggleBtn) {
+            const grid = toggleBtn.closest(".poa-toggle-grid");
+            if (grid.dataset.mode === "single") {
+                grid.querySelectorAll(".poa-toggle-btn").forEach(b => b.classList.remove("selected"));
+                toggleBtn.classList.add("selected");
+            } else {
+                toggleBtn.classList.toggle("selected");
+            }
+            return;
+        }
+
         // 世界书扫描
         if (e.target.id === "poa-scan-btn") {
             toastr.info("正在扫描角色卡...");
@@ -755,11 +871,15 @@ function setupGlobalDelegation() {
         if (e.target.id === "poa-gen-rough") {
             const popup = e.target.closest("#poa-popup");
             const brief = popup.querySelector("#poa-outline-brief")?.value || "";
-            const selectedPlots = Array.from(popup.querySelector("#poa-plot-select")?.selectedOptions || []).map(o => o.value);
-            const selectedShuang = Array.from(popup.querySelectorAll(".poa-shuang-cb:checked")).map(cb => cb.value);
+            const getSelected = (gridId) => Array.from(popup.querySelectorAll(`#${gridId} .poa-toggle-btn.selected`)).map(b => b.dataset.value);
+            const selectedPlots = getSelected("poa-plot-toggle");
+            const selectedShuang = getSelected("poa-shuang-toggle");
+            const selectedGenres = getSelected("poa-genre-toggle");
+            const selectedEndingArr = getSelected("poa-ending-toggle");
+            const selectedEnding = selectedEndingArr[0] || "";
             toastr.info("正在生成粗纲...");
             try {
-                const result = await generateRoughOutline(charId, brief, selectedPlots, selectedShuang);
+                const result = await generateRoughOutline(charId, brief, selectedPlots, selectedShuang, selectedGenres, selectedEnding);
                 if (result) {
                     toastr.success("粗纲生成完成");
                     await refreshPopup();
@@ -796,11 +916,29 @@ function setupGlobalDelegation() {
             return;
         }
 
-        // 悬浮窗关闭按钮
+        // 悬浮窗收起按钮(缩回小圆图标,不是彻底关闭——彻底关闭走设置页的悬浮窗开关)
         if (e.target.id === "poa-floating-close") {
-            toggleFloatingWindow(false);
-            ensureSettings().floatingWindow = false;
-            saveSettingsDebounced();
+            collapseFloatingWindow();
+            return;
+        }
+
+        // 拉取模型列表
+        if (e.target.id === "poa-fetch-models") {
+            toastr.info("正在拉取模型列表...");
+            try {
+                const models = await fetchAvailableModels();
+                const popup = e.target.closest("#poa-popup");
+                const container = popup.querySelector("#poa-model-list-container");
+                if (!models.length) {
+                    container.innerHTML = `<span class="poa-muted">没拉到模型,检查Key是否正确</span>`;
+                    return;
+                }
+                container.innerHTML = `<select id="poa-model-select" class="text_pole" style="margin-top:6px">${models.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("")}</select>`;
+                toastr.success(`拉取到${models.length}个模型,选一个`);
+            } catch (err) {
+                console.error(err);
+                toastr.error("拉取失败: " + err.message);
+            }
             return;
         }
     });
@@ -808,21 +946,41 @@ function setupGlobalDelegation() {
     // ---- 回车添加自定义标签 ----
     document.addEventListener("keydown", (e) => {
         if (e.key !== "Enter") return;
-        if (e.target.id !== "poa-custom-tag-input") return;
-        e.preventDefault();
-        const charId = getCurrentCharId();
-        const profile = getCharProfile(charId);
-        const settings = ensureSettings();
-        const total = profile.mainTags.length + profile.expTags.length + profile.customTags.length;
-        if (total >= settings.maxTagsTotal) {
-            toastr.warning(`标签总数已达上限(${settings.maxTagsTotal})`);
+
+        if (e.target.id === "poa-custom-tag-input") {
+            e.preventDefault();
+            const charId = getCurrentCharId();
+            const profile = getCharProfile(charId);
+            const settings = ensureSettings();
+            const total = profile.mainTags.length + profile.expTags.length + profile.customTags.length;
+            if (total >= settings.maxTagsTotal) {
+                toastr.warning(`标签总数已达上限(${settings.maxTagsTotal})`);
+                return;
+            }
+            const val = e.target.value.trim();
+            if (val) {
+                profile.customTags.push(val);
+                saveSettingsDebounced();
+                refreshPopup();
+            }
             return;
         }
-        const val = e.target.value.trim();
-        if (val) {
-            profile.customTags.push(val);
-            saveSettingsDebounced();
-            refreshPopup();
+
+        // 自定义爽点(无上限,持久保存,添加后自动勾选)
+        if (e.target.id === "poa-add-shuangdian-input") {
+            e.preventDefault();
+            const val = e.target.value.trim();
+            if (!val) return;
+            const settings = ensureSettings();
+            if (!settings.customShuangDian.includes(val)) {
+                settings.customShuangDian.push(val);
+                saveSettingsDebounced();
+            }
+            refreshPopup().then(() => {
+                const btn = document.querySelector(`#poa-shuang-toggle .poa-toggle-btn[data-value="${CSS.escape(val)}"]`);
+                btn?.classList.add("selected");
+            });
+            return;
         }
     });
 
@@ -882,12 +1040,31 @@ function setupGlobalDelegation() {
             return;
         }
 
+        // 从拉取到的模型列表里选中一个,写回模型名输入框
+        if (e.target.id === "poa-model-select") {
+            settings.apiModel = e.target.value;
+            saveSettingsDebounced();
+            const popup = e.target.closest("#poa-popup");
+            const modelInput = popup?.querySelector("#poa-api-model");
+            if (modelInput) modelInput.value = e.target.value;
+            toastr.success("已选择模型: " + e.target.value);
+            return;
+        }
+
         if (e.target.id === "poa-floating-toggle") {
             settings.floatingWindow = e.target.checked;
             saveSettingsDebounced();
             toggleFloatingWindow(e.target.checked);
             return;
         }
+    });
+
+    // ---- input 事件(输入即保存,防止change/blur没触发导致"填了但没存住") ----
+    document.addEventListener("input", (e) => {
+        const settings = ensureSettings();
+        if (e.target.id === "poa-api-key") { settings.apiKey = e.target.value; saveSettingsDebounced(); }
+        else if (e.target.id === "poa-api-base") { settings.apiBaseUrl = e.target.value; saveSettingsDebounced(); }
+        else if (e.target.id === "poa-api-model") { settings.apiModel = e.target.value; saveSettingsDebounced(); }
     });
 
     // ---- blur 事件(可编辑字段保存,blur不冒泡,需要capture) ----
