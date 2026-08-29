@@ -402,7 +402,27 @@ function getRecentChatSummaryText(maxMessages = 12) {
     }
 }
 
-function buildOutlineContextBlock(charId) {
+// 读取酒馆里配置的user人设(Persona),不用你手动贴给我,插件自己去读
+async function getUserPersonaText() {
+    const context = getContext();
+    const name = context.name1 || "{{user}}";
+    let description = "";
+    try {
+        // power-user.js 是酒馆内部存放Persona设置的文件,不同版本字段可能有差异,
+        // 这里做多重兜底尝试,任何一步失败都不影响其他功能(用户人设读不到就留空,不报错)。
+        const puModule = await import("../../../power-user.js");
+        const power_user = puModule.power_user;
+        const avatar = context.userAvatar || power_user?.default_avatar;
+        description = power_user?.persona_description
+            || power_user?.persona_descriptions?.[avatar]?.description
+            || "";
+    } catch (err) {
+        console.warn("[爽文大纲助手] 读取user人设失败(不影响其他功能,可能是酒馆版本字段差异):", err);
+    }
+    return { name, description };
+}
+
+function buildOutlineContextBlock(charId, userPersona) {
     const profile = getCharProfile(charId);
     const settings = ensureSettings();
     const tagLine = `主标签: ${profile.mainTags.join("、") || "(未提取)"}\n经历标签: ${profile.expTags.join("、") || "(无)"}\n自定义标签: ${profile.customTags.join("、") || "(无)"}`;
@@ -426,20 +446,31 @@ function buildOutlineContextBlock(charId) {
         ? `最近的对话记录(如果这不是全新对话,大纲要衔接这里已经发生的剧情,不能无视既成事实重新开始):\n${recentChat}`
         : "对话记录: (当前是全新对话,或还没有历史消息)";
 
-    return `${tagLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}\n\n${openingLine}\n\n${chatLine}`;
+    const userLine = userPersona?.description
+        ? `user(${userPersona.name})的人设:\n${userPersona.description.slice(0, 500)}\n注意: 关系的推进逻辑要同时考虑这个人物和角色两边的性格,不能只顾角色单方面的心理,双方互动要合理。`
+        : `user(${userPersona?.name || "{{user}}"})的人设: (未配置或读取不到,按普通身份处理)`;
+
+    return `${tagLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}\n\n${openingLine}\n\n${chatLine}\n\n${userLine}`;
 }
 
 async function generateRoughOutline(charId, userBrief, selectedPlots, selectedShuangDian, selectedGenres, selectedEnding) {
-    const contextBlock = buildOutlineContextBlock(charId);
+    const userPersona = await getUserPersonaText();
+    const contextBlock = buildOutlineContextBlock(charId, userPersona);
     const settings = ensureSettings();
     const actCount = settings.actCount || 8;
 
     const systemPrompt = `你是资深网络小说策划,深谙"开端-发展-高潮-结局"的经典网文结构和读者心理。
 粗纲只是骨架,分成${actCount}幕左右(允许±2幕的浮动,以故事需要为准),每幕只需要用简短的几句话说清楚:目标、核心转折、结尾状态——不要写细节,细节留给细纲阶段。
-人物的每一个关键行动都必须能用他的性格标签解释,不能是为了推进情节而让人物行动。
+
+【构建每一幕必须遵循这个三层顺序,不能跳步或颠倒】
+第一层-情节骨架:先确定这一幕用的是"经典情节20种"里的哪一种或哪几种组合(比如复仇+落魄之人),这是这一幕的事件框架,决定"发生了什么类型的事"。
+第二层-叠加爽点:在情节骨架之上,把勾选的爽点(比如信息差、扮猪吃虎、当众打脸)安插进这个框架里的具体节点,决定"爽感从哪个环节释放"。
+第三层-性格微调:最后用人物的核心性格标签,决定"这个人物在这个情节+爽点组合下具体会怎么做、说什么话、用什么方式"——同样的情节骨架配不同性格标签的人物,应该演出完全不同的戏。人物的每一个关键行动都必须能用他的性格标签解释,不能是为了推进情节而让人物行动。关系推进的具体方式(比如靠信任建立、还是靠互相试探/利用、还是靠博弈)必须从人物的核心性格标签反推,不能默认套用"并肩作战建立信任"这类俗套走向——如果标签写的是"极端利己""控制狂""多重面具"这种,关系大概率是靠试探、交易、博弈来推进的,不是靠温情。同时要考虑user人设的性格,关系是双向的,不能只从角色一方的心理出发。
+
 整体节奏必须有张有弛:不能全程日常,也不能全程高强度冲突,压抑与释放要交替出现,前期埋的伏笔要在后面的幕里回收。
+措辞要具体、有戏剧张力,不要写"确立XX之间的界限与默契"这类抽象空洞的模板化描述,每一幕的目标/转折都要能让人一眼看出具体发生了什么冲突。
 严格遵守人物规则句,不能写出违反规则的行为。若提供了最近的对话记录,大纲要衔接已经发生的剧情,不能无视既成事实重新开始。
-只输出JSON数组,每个元素: {"act": 幕序号, "title": "幕标题", "goal": "目标(一句话)", "turn": "核心转折(一句话)", "endState": "结尾状态(一句话)"}。不要输出其他文字。`;
+只输出JSON数组,每个元素: {"act": 幕序号, "title": "幕标题", "plotType": "这一幕用的情节类型(第一层)", "goal": "目标(一句话,具体)", "turn": "核心转折(一句话,具体)", "endState": "结尾状态(一句话,具体)"}。不要输出其他文字。`;
 
     const genreDefLines = (selectedGenres || []).filter(g => GENRE_DEFINITIONS[g]).map(g => `${g}: ${GENRE_DEFINITIONS[g]}`).join("\n");
 
@@ -479,7 +510,8 @@ async function generateDetailedOutline(charId, actIndex, priorForeshadows = []) 
         toastr.error("找不到对应的粗纲幕,请先生成粗纲。");
         return null;
     }
-    const contextBlock = buildOutlineContextBlock(charId);
+    const userPersona = await getUserPersonaText();
+    const contextBlock = buildOutlineContextBlock(charId, userPersona);
     const settings = ensureSettings();
     const meta = store.meta || {};
 
@@ -489,16 +521,24 @@ async function generateDetailedOutline(charId, actIndex, priorForeshadows = []) 
         : "";
 
     const systemPrompt = `你是资深网络小说策划。现在要把一幕粗纲展开成"细纲"——具体到每个场景/章节,这是整个大纲里最重要的部分,必须写详细,不能敷衍。
-每个场景必须包含7个字段,不能省略:
-- goal(目标) - obstacle(阻碍) - action(人物具体行动,必须由其性格标签驱动,不是为了情节而行动)
+
+【构建每个场景必须遵循这个三层顺序,不能跳步或颠倒】
+第一层-情节骨架:这一幕定的情节类型是"${act.plotType || meta.selectedPlots?.join("、") || "不限,你自行判断"}",场景的事件走向要落在这个骨架里(比如骨架是"复仇",场景就该围绕查真相、布局、动手这类节点展开,不能跑去写风花雪月的日常)。
+第二层-叠加爽点:勾选的爽点是"${meta.selectedShuangDian?.join("、") || "未指定"}",把这些爽点安插进上面的情节节点里,决定"这一步的爽感具体从哪里释放"(比如骨架走到"布局"这一步时,用信息差或扮猪吃虎来实现)。
+第三层-性格微调:最后用人物性格标签决定人物具体怎么做、说什么话。同样的情节+爽点组合,配不同性格的人物,行为方式必须不同。
+
+每个场景必须包含8个字段,不能省略:
+- goal(目标) - obstacle(阻碍) - action(人物具体行动,必须由其性格标签驱动,不是为了情节而行动,关系推进方式要符合人物性格,不要默认套用俗套走向)
 - result(结果/转折) - valueChange(数值变化,格式如"好感度+5"或直接写"好感度: 具体判断理由") - foreshadow(这个场景埋下的新伏笔,或回收了哪个旧伏笔,写清楚是"埋"还是"收") - hook(结尾钩子/爽点落点)
+- intimacyStage(亲密关系推进到哪一步,只标阶段不写具体内容,取值:"无"/"暧昧"/"肢体接触"/"更进一步"/"回落"之一,推进要循序渐进符合当前关系阶段,不要跳步)
 情感数值节奏: ${buildValueTrendLine(settings)}
 体裁要求: ${meta.selectedGenres?.join("、") || "(未指定)"}${genreDefLines ? `\n体裁定义(严格按此理解):\n${genreDefLines}` : ""}
 ${foreshadowLine}
-这一幕内部的节奏也要有张弛(不能从头到尾都是同一种强度),按20种经典情节类型(${meta.selectedPlots?.join("、") || "不限"})的骨架来组织事件,但人物的具体反应必须由性格标签决定,同样的情节骨架配不同性格的人物应该演出不同的戏。
-只输出JSON数组,每个元素包含上述7个字段加"scene"(场景序号)。不要输出其他文字。`;
+这一幕内部的节奏也要有张弛(不能从头到尾都是同一种强度)。
+措辞要具体,不要写抽象空洞的模板化描述。
+只输出JSON数组,每个元素包含上述8个字段加"scene"(场景序号)。不要输出其他文字。`;
 
-    const userPrompt = `人物档案:\n${contextBlock}\n\n当前幕: ${act.title}\n目标: ${act.goal}\n核心转折: ${act.turn}\n结尾状态: ${act.endState}\n\n请把这一幕拆成4-8个场景的细纲,场景之间要有起伏,不要匀速平铺直叙。`;
+    const userPrompt = `人物档案:\n${contextBlock}\n\n当前幕: ${act.title}\n这一幕的情节类型: ${act.plotType || "(未指定)"}\n目标: ${act.goal}\n核心转折: ${act.turn}\n结尾状态: ${act.endState}\n\n请把这一幕拆成4-8个场景的细纲,场景之间要有起伏,不要匀速平铺直叙。`;
 
     const raw = await callIndependentApi(userPrompt, systemPrompt);
     let parsed;
@@ -536,6 +576,51 @@ async function generateFullDetailedOutline(charId, onProgress) {
         }
     }
     return store.detailed;
+}
+
+// 剧情偏离检测 + 最小代价重新对齐("蝴蝶效应"处理):
+// 拿最近实际发生的对话,跟当前大纲比对,如果user的选择让走向偏离了,
+// 只让AI修改从偏离点往后受影响的部分,已经吻合的内容原样保留,不做整体重写。
+async function realignOutlineWithChat(charId) {
+    const store = getOutlineStore(charId);
+    if (!store.rough.length) {
+        toastr.warning("还没有大纲,无法对齐,先生成粗纲。");
+        return null;
+    }
+    const recentChat = getRecentChatSummaryText(30);
+    if (!recentChat) {
+        toastr.warning("还没有对话记录可供比对。");
+        return null;
+    }
+    const currentOutlineJson = JSON.stringify({ rough: store.rough, detailed: store.detailed || [] });
+
+    const systemPrompt = `你是网络小说编辑,负责比对"计划大纲"和"实际已经发生的剧情",判断是否出现偏离(比如user做出了大纲没预料到的选择、关系走向变了、某个安排好的事件没发生反而发生了别的事)。
+如果实际剧情和大纲基本一致(哪怕有些小出入但不影响后续走向),输出: {"diverged": false}
+如果确实偏离了,遵循"改动最小代价"原则:只修改从偏离点开始、往后受影响的幕和场景,已经发生且和实际剧情吻合的部分原样保留,一个字都不要改。
+输出格式: {"diverged": true, "rough": [...完整的粗纲数组,结构和输入一致...], "detailed": [[...第一幕的场景数组...], [...第二幕...], ...], "changeSummary": "用2-3句话说清楚具体改了哪里、为什么改,方便user快速了解发生了什么"}
+只输出JSON,不要输出其他文字。`;
+
+    const userPrompt = `当前大纲(JSON,rough是幕,detailed是每幕对应的场景数组):\n${currentOutlineJson}\n\n最近实际发生的对话(倒序看时间线):\n${recentChat}`;
+
+    const raw = await callIndependentApi(userPrompt, systemPrompt);
+    let parsed;
+    try {
+        const jsonMatch = raw.match(/\{[\s\S]*\}/);
+        parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+    } catch (err) {
+        console.error("[爽文大纲助手] 对齐检测解析失败:", raw);
+        toastr.error("对齐检测返回格式异常,请重试。");
+        return null;
+    }
+
+    if (!parsed.diverged) {
+        return { diverged: false };
+    }
+
+    if (Array.isArray(parsed.rough)) store.rough = parsed.rough;
+    if (Array.isArray(parsed.detailed)) store.detailed = parsed.detailed;
+    saveSettingsDebounced();
+    return { diverged: true, changeSummary: parsed.changeSummary || "(未提供具体说明)" };
 }
 
 function clearOutline(charId) {
@@ -625,6 +710,7 @@ function renderDetailedTable(scenes, actIdx) {
             <td class="poa-editable" contenteditable="true" data-field="action" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.action)}</td>
             <td class="poa-editable" contenteditable="true" data-field="result" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.result)}</td>
             <td class="poa-editable" contenteditable="true" data-field="valueChange" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.valueChange)}</td>
+            <td class="poa-editable" contenteditable="true" data-field="intimacyStage" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.intimacyStage || "无")}</td>
             <td class="poa-editable" contenteditable="true" data-field="foreshadow" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.foreshadow)}</td>
             <td class="poa-editable" contenteditable="true" data-field="hook" data-act="${actIdx}" data-scene="${i}">${escapeHtml(s.hook)}</td>
             <td><span class="poa-delete-scene" data-act="${actIdx}" data-scene="${i}" title="删除这一场景">🗑</span></td>
@@ -632,7 +718,7 @@ function renderDetailedTable(scenes, actIdx) {
     `).join("");
     return `
         <table class="poa-detail-table">
-            <thead><tr><th>#</th><th>目标</th><th>阻碍</th><th>行动</th><th>结果</th><th>数值变化</th><th>伏笔</th><th>钩子</th><th></th></tr></thead>
+            <thead><tr><th>#</th><th>目标</th><th>阻碍</th><th>行动</th><th>结果</th><th>数值变化</th><th>亲密阶段</th><th>伏笔</th><th>钩子</th><th></th></tr></thead>
             <tbody>${rows}</tbody>
         </table>
     `;
@@ -657,6 +743,7 @@ async function renderPopupInner() {
                     <button class="menu_button poa-delete-act" data-idx="${i}" title="删除这一幕">🗑</button>
                 </span>
             </div>
+            <div>情节类型: <span class="poa-editable" contenteditable="true" data-field="plotType" data-idx="${i}">${escapeHtml(a.plotType || "(未指定)")}</span></div>
             <div>目标: <span class="poa-editable" contenteditable="true" data-field="goal" data-idx="${i}">${escapeHtml(a.goal)}</span></div>
             <div>转折: <span class="poa-editable" contenteditable="true" data-field="turn" data-idx="${i}">${escapeHtml(a.turn)}</span></div>
             <div>结尾状态: <span class="poa-editable" contenteditable="true" data-field="endState" data-idx="${i}">${escapeHtml(a.endState)}</span></div>
@@ -733,6 +820,7 @@ async function renderPopupInner() {
             </div>
             <button class="menu_button" id="poa-gen-rough">① 生成粗纲</button>
             <button class="menu_button" id="poa-gen-full-detail">② 一键生成完整细纲(所有幕)</button>
+            <button class="menu_button" id="poa-realign-outline">③ 检测剧情偏离/对齐大纲</button>
             <button class="menu_button" id="poa-inject-outline">注入到对话上下文</button>
             <button class="menu_button" id="poa-preview-inject">预览/复制注入内容</button>
             <button class="menu_button" id="poa-clear-outline" style="background:#a33">清空大纲</button>
@@ -1062,6 +1150,25 @@ function setupGlobalDelegation() {
             clearOutline(charId);
             toastr.success("大纲已清空");
             await refreshPopup();
+            return;
+        }
+
+        // 检测剧情偏离 / 最小代价对齐大纲("蝴蝶效应"处理)
+        if (e.target.id === "poa-realign-outline") {
+            toastr.info("正在比对实际剧情和大纲...");
+            try {
+                const result = await realignOutlineWithChat(charId);
+                if (result?.diverged === false) {
+                    toastr.success("剧情和大纲基本吻合,不需要改动");
+                } else if (result?.diverged === true) {
+                    toastr.success("检测到偏离,已用最小改动重新对齐");
+                    window.alert(`大纲已调整:\n\n${result.changeSummary}`);
+                    await refreshPopup();
+                }
+            } catch (err) {
+                console.error(err);
+                toastr.error("对齐失败: " + err.message);
+            }
             return;
         }
 
