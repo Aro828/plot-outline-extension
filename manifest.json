@@ -1,0 +1,12 @@
+{
+  "display_name": "爽文大纲助手",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "user",
+  "version": "1.0.0",
+  "homePage": "https://github.com/Aro828/plot-outline-extension",
+  "auto_update": false
+}
