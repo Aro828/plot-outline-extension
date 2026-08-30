@@ -40,6 +40,7 @@ const defaultSettings = {
     outlines: {}, // { charId: { rough: [...], detailed: [...] } }
     tagLibrary: null, // 懒加载自 lib/*.json,可在运行时被用户扩充
     customShuangDian: [], // 用户自定义爽点,持久保存,跨角色可复用
+    userPersonaOverride: "", // user人设的手动兜底文本——自动读取跨酒馆版本不稳定,这里给个手动确认/编辑入口保底
 };
 
 function ensureSettings() {
@@ -106,9 +107,10 @@ function getCharProfile(charId) {
 function getOutlineStore(charId) {
     const settings = ensureSettings();
     if (!settings.outlines[charId]) {
-        settings.outlines[charId] = { rough: [], detailed: [], meta: {} };
+        settings.outlines[charId] = { rough: [], detailed: [], meta: {}, arc: null };
     }
     if (!settings.outlines[charId].meta) settings.outlines[charId].meta = {};
+    if (settings.outlines[charId].arc === undefined) settings.outlines[charId].arc = null;
     return settings.outlines[charId];
 }
 
@@ -403,29 +405,97 @@ function getRecentChatSummaryText(maxMessages = 12) {
 }
 
 // 读取酒馆里配置的user人设(Persona),不用你手动贴给我,插件自己去读
-async function getUserPersonaText() {
+// 自动尝试读取酒馆里配置的Persona——不同酒馆版本内部变量名可能不一样,
+// 多路径依次尝试,任何一步失败都吞掉错误继续试下一个,不拖垮其他功能。
+async function attemptAutoDetectUserPersona() {
     const context = getContext();
-    const name = context.name1 || "{{user}}";
-    let description = "";
+    const candidates = [];
+
     try {
-        // power-user.js 是酒馆内部存放Persona设置的文件,不同版本字段可能有差异,
-        // 这里做多重兜底尝试,任何一步失败都不影响其他功能(用户人设读不到就留空,不报错)。
         const puModule = await import("../../../power-user.js");
         const power_user = puModule.power_user;
         const avatar = context.userAvatar || power_user?.default_avatar;
-        description = power_user?.persona_description
-            || power_user?.persona_descriptions?.[avatar]?.description
-            || "";
+        if (power_user?.persona_descriptions?.[avatar]?.description) {
+            candidates.push(power_user.persona_descriptions[avatar].description);
+        }
+        if (power_user?.persona_description) {
+            candidates.push(power_user.persona_description);
+        }
     } catch (err) {
-        console.warn("[爽文大纲助手] 读取user人设失败(不影响其他功能,可能是酒馆版本字段差异):", err);
+        console.warn("[爽文大纲助手] power-user.js 读取失败,尝试下一种方式:", err);
+    }
+
+    try {
+        if (context.powerUserSettings?.persona_description) {
+            candidates.push(context.powerUserSettings.persona_description);
+        }
+    } catch (err) { /* 忽略,继续尝试 */ }
+
+    try {
+        if (context.persona_description) {
+            candidates.push(context.persona_description);
+        }
+    } catch (err) { /* 忽略 */ }
+
+    return candidates.find(c => c && c.trim().length > 0) || "";
+}
+
+// 最终使用的user人设:手动填写的内容优先(最可靠),没填过才用自动尝试的结果。
+async function getUserPersonaText() {
+    const context = getContext();
+    const name = context.name1 || "{{user}}";
+    const settings = ensureSettings();
+
+    if (settings.userPersonaOverride && settings.userPersonaOverride.trim()) {
+        return { name, description: settings.userPersonaOverride.trim() };
+    }
+
+    let description = "";
+    try {
+        description = await attemptAutoDetectUserPersona();
+    } catch (err) {
+        console.warn("[爽文大纲助手] 读取user人设失败(不影响其他功能):", err);
     }
     return { name, description };
+}
+
+// 根据标签名字,从已加载的标签库里查出完整定义(渴望/恐惧/关键词),
+// 不再只把"游戏改变者"这四个字扔给AI自己脑补。
+function getArchetypeDefinitionText(tagNames) {
+    const settings = ensureSettings();
+    const archetypes = settings.tagLibrary?.archetypes?.main_archetypes || [];
+    const lines = [];
+    for (const name of tagNames || []) {
+        const found = archetypes.find(a => a.name === name || name.includes(a.name));
+        if (found) {
+            lines.push(`${found.name}(${found.light || ""}${found.shadow ? "/" + found.shadow : ""}): 核心渴望=${found.core_desire}; 核心恐惧=${found.core_fear}; 关键词=${(found.keywords || []).join("、")}`);
+        }
+    }
+    return lines.join("\n");
+}
+
+// 人物卡原文(description+personality+scenario),这是goals/weakness/secrets/
+// 行为边界规则这些关键信息实际存放的地方——之前只传AI提取的几个标签词,原文完全没传,
+// 这是大纲写得OOC、套模板的根本原因之一。
+function getCharacterCardRawText(maxLength = 4000) {
+    const char = getCurrentCharCard();
+    if (!char) return "";
+    const raw = [char.description, char.personality, char.scenario].filter(Boolean).join("\n\n");
+    return raw.slice(0, maxLength);
 }
 
 function buildOutlineContextBlock(charId, userPersona) {
     const profile = getCharProfile(charId);
     const settings = ensureSettings();
-    const tagLine = `主标签: ${profile.mainTags.join("、") || "(未提取)"}\n经历标签: ${profile.expTags.join("、") || "(无)"}\n自定义标签: ${profile.customTags.join("、") || "(无)"}`;
+    const allTags = [...profile.mainTags, ...profile.expTags, ...profile.customTags];
+    const archetypeDefs = getArchetypeDefinitionText(profile.mainTags);
+    const tagLine = `主标签: ${profile.mainTags.join("、") || "(未提取)"}${archetypeDefs ? `\n主标签的完整定义(务必按这个理解,不要只看标签名字脑补):\n${archetypeDefs}` : ""}\n经历标签: ${profile.expTags.join("、") || "(无)"}\n自定义标签: ${profile.customTags.join("、") || "(无)"}`;
+
+    const cardRaw = getCharacterCardRawText();
+    const cardRawLine = cardRaw
+        ? `人物卡原文(目标/弱点/秘密/行为边界等关键设定都在这里,大纲必须紧贴这些内容,不能脱离原文凭空发挥):\n${cardRaw}`
+        : "人物卡原文: (未读取到)";
+
     const ruleLine = profile.rules.length
         ? `规则句(不可违反):\n- ${profile.rules.join("\n- ")}`
         : "规则句: (未扫描到,建议先运行世界书扫描)";
@@ -447,10 +517,10 @@ function buildOutlineContextBlock(charId, userPersona) {
         : "对话记录: (当前是全新对话,或还没有历史消息)";
 
     const userLine = userPersona?.description
-        ? `user(${userPersona.name})的人设:\n${userPersona.description.slice(0, 500)}\n注意: 关系的推进逻辑要同时考虑这个人物和角色两边的性格,不能只顾角色单方面的心理,双方互动要合理。`
+        ? `user(${userPersona.name})的人设:\n${userPersona.description.slice(0, 800)}\n注意: 关系的推进逻辑要同时考虑这个人物和角色两边的性格,不能只顾角色单方面的心理,双方互动要合理。`
         : `user(${userPersona?.name || "{{user}}"})的人设: (未配置或读取不到,按普通身份处理)`;
 
-    return `${tagLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}\n\n${openingLine}\n\n${chatLine}\n\n${userLine}`;
+    return `${tagLine}\n\n${cardRawLine}\n\n${ruleLine}\n\n数值状态:\n${valueLines || "(暂无数值记录)"}\n\n${pacingLine}\n\n${openingLine}\n\n${chatLine}\n\n${userLine}`;
 }
 
 async function generateRoughOutline(charId, userBrief, selectedPlots, selectedShuangDian, selectedGenres, selectedEnding) {
@@ -459,18 +529,33 @@ async function generateRoughOutline(charId, userBrief, selectedPlots, selectedSh
     const settings = ensureSettings();
     const actCount = settings.actCount || 8;
 
-    const systemPrompt = `你是资深网络小说策划,深谙"开端-发展-高潮-结局"的经典网文结构和读者心理。
-粗纲只是骨架,分成${actCount}幕左右(允许±2幕的浮动,以故事需要为准),每幕只需要用简短的几句话说清楚:目标、核心转折、结尾状态——不要写细节,细节留给细纲阶段。
+    const systemPrompt = `你是资深网络小说策划,深谙"开端-发展-高潮-结局"的经典网文结构、读者心理,以及专业编剧理论里的"人物弧光"设计方法。
+粗纲只是骨架,分成${actCount}幕左右(允许±2幕的浮动,以故事需要为准),每幕只需要用简短的几句话说清楚——不要写细节,细节留给细纲阶段。
 
-【构建每一幕必须遵循这个三层顺序,不能跳步或颠倒】
-第一层-情节骨架:先确定这一幕用的是"经典情节20种"里的哪一种或哪几种组合(比如复仇+落魄之人),这是这一幕的事件框架,决定"发生了什么类型的事"。
-第二层-叠加爽点:在情节骨架之上,把勾选的爽点(比如信息差、扮猪吃虎、当众打脸)安插进这个框架里的具体节点,决定"爽感从哪个环节释放"。
-第三层-性格微调:最后用人物的核心性格标签,决定"这个人物在这个情节+爽点组合下具体会怎么做、说什么话、用什么方式"——同样的情节骨架配不同性格标签的人物,应该演出完全不同的戏。人物的每一个关键行动都必须能用他的性格标签解释,不能是为了推进情节而让人物行动。关系推进的具体方式(比如靠信任建立、还是靠互相试探/利用、还是靠博弈)必须从人物的核心性格标签反推,不能默认套用"并肩作战建立信任"这类俗套走向——如果标签写的是"极端利己""控制狂""多重面具"这种,关系大概率是靠试探、交易、博弈来推进的,不是靠温情。同时要考虑user人设的性格,关系是双向的,不能只从角色一方的心理出发。
+【第一步:先设计人物弧光,这是整个大纲的灵魂,必须深挖,不能是标签的简单翻转】
+结合人物卡原文里的目标/弱点/秘密/背景创伤,以及主标签的核心恐惧,找出这个人物的:
+- 伤痛(wound): 他过去因为什么受过真正的伤,这段经历怎么塑造了他现在的行事方式
+- 谎言(lie): 因为这段伤痛,他对自己或世界抱持的一个"错误信念",这个信念驱动着他现在几乎所有的算计和防御机制(比如"只有把自己变成工具、切割真实情感,才能保护重要的人和自己活下去")
+- 真相(truth): 与这个谎言相对的真相是什么
+- 弧光类型: 根据人物性格和结局要求,判断这次该是"成长弧"(人物在压力下逐渐直面真相,哪怕代价巨大也做出改变,人格走向完整)还是"毁灭弧"(人物始终无法放下这个谎言,在压力下越陷越深,最终被这个谎言反噬,滑向黑化/沉沦/死亡等代价)。这不是简单的"从阴暗面滑向光明面"式的表面反转,核心是这个人物的心理机制发生了真实的转变或彻底的崩溃。
 
-整体节奏必须有张有弛:不能全程日常,也不能全程高强度冲突,压抑与释放要交替出现,前期埋的伏笔要在后面的幕里回收。
+【第二步:每一幕都要能在"三层结构"里落地,并且明确标出这一幕对应弧光的哪个阶段】
+第一层-情节骨架:先确定这一幕用的是"经典情节20种"里的哪一种或哪几种组合,这是这一幕的事件框架。
+第二层-叠加爽点:在情节骨架之上,把勾选的爽点安插进具体节点,每一幕都必须有一个具体的爽点高潮(强度可以有大小之分,跟着整体节奏走,但不能没有),不能只是平铺直叙的日常。
+第三层-性格微调:用人物的核心性格标签和已经确定的"谎言"机制,决定这个人物在这个情节+爽点组合下具体会怎么做——关系推进方式必须从性格反推,不能默认套用俗套走向,同时要考虑user人设的性格,关系是双向的。
+每一幕还必须标出对应弧光阶段(arcStage,取值之一: "铺垫谎言的运作"/"谎言被动摇但人物本能强化旧模式"/"伤痛被逼到明处"/"抉择时刻"/"结果与新常态"),并且每一幕都必须埋下或回收至少一个伏笔,不能省略。
+
+整体节奏必须有张有弛:不能全程日常,也不能全程高强度冲突,压抑与释放要交替出现。
 措辞要具体、有戏剧张力,不要写"确立XX之间的界限与默契"这类抽象空洞的模板化描述,每一幕的目标/转折都要能让人一眼看出具体发生了什么冲突。
-严格遵守人物规则句,不能写出违反规则的行为。若提供了最近的对话记录,大纲要衔接已经发生的剧情,不能无视既成事实重新开始。
-只输出JSON数组,每个元素: {"act": 幕序号, "title": "幕标题", "plotType": "这一幕用的情节类型(第一层)", "goal": "目标(一句话,具体)", "turn": "核心转折(一句话,具体)", "endState": "结尾状态(一句话,具体)"}。不要输出其他文字。`;
+严格遵守人物规则句,不能写出违反规则的行为(不要OOC)。若提供了最近的对话记录,大纲要衔接已经发生的剧情,不能无视既成事实重新开始。
+
+只输出一个JSON对象,格式如下,不要输出其他文字:
+{
+  "arc": {"wound": "伤痛", "lie": "谎言", "truth": "真相", "arcType": "成长" 或 "毁灭", "arcSummary": "用3-4句话概括这个人物从哪里到哪里,经历了什么心理转变或崩溃"},
+  "acts": [
+    {"act": 幕序号, "title": "幕标题", "plotType": "这一幕用的情节类型", "arcStage": "对应弧光阶段", "shuangDianMoment": "这一幕具体的爽点高潮是什么,写具体内容不能空泛", "foreshadowPlan": "这一幕计划埋下或回收的伏笔,必须有", "goal": "目标(一句话,具体)", "turn": "核心转折(一句话,具体)", "endState": "结尾状态(一句话,具体)"}
+  ]
+}`;
 
     const genreDefLines = (selectedGenres || []).filter(g => GENRE_DEFINITIONS[g]).map(g => `${g}: ${GENRE_DEFINITIONS[g]}`).join("\n");
 
@@ -479,7 +564,7 @@ async function generateRoughOutline(charId, userBrief, selectedPlots, selectedSh
     const raw = await callIndependentApi(userPrompt, systemPrompt);
     let parsed;
     try {
-        const jsonMatch = raw.match(/\[[\s\S]*\]/);
+        const jsonMatch = raw.match(/\{[\s\S]*\}/);
         parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
     } catch (err) {
         console.error("[爽文大纲助手] 粗纲解析失败:", raw);
@@ -487,13 +572,20 @@ async function generateRoughOutline(charId, userBrief, selectedPlots, selectedSh
         return null;
     }
 
+    if (!Array.isArray(parsed.acts)) {
+        console.error("[爽文大纲助手] 粗纲返回缺少acts数组:", parsed);
+        toastr.error("粗纲生成格式不完整,请重试。");
+        return null;
+    }
+
     const store = getOutlineStore(charId);
-    store.rough = parsed;
+    store.rough = parsed.acts;
+    store.arc = parsed.arc || null;
     store.detailed = [];
     // 记住这次生成用的选项,细纲阶段(尤其是"一键生成完整细纲")复用,不用重新勾选
     store.meta = { selectedPlots, selectedShuangDian, selectedGenres, selectedEnding, userBrief };
     saveSettingsDebounced();
-    return parsed;
+    return parsed.acts;
 }
 
 function buildValueTrendLine(settings) {
@@ -522,10 +614,20 @@ async function generateDetailedOutline(charId, actIndex, priorForeshadows = []) 
 
     const systemPrompt = `你是资深网络小说策划。现在要把一幕粗纲展开成"细纲"——具体到每个场景/章节,这是整个大纲里最重要的部分,必须写详细,不能敷衍。
 
+【人物弧光阶段(必须体现在这一幕的场景里)】
+这一幕对应的弧光阶段是: "${act.arcStage || "未指定"}"
+人物的谎言(错误信念): ${store.arc?.lie || "(未生成弧光定义)"}
+人物的伤痛: ${store.arc?.wound || "(未生成弧光定义)"}
+弧光类型: ${store.arc?.arcType || "未指定"} —— 如果是"成长弧",场景要体现人物在这个阶段对谎言的态度变化(哪怕只是极细微的动摇);如果是"毁灭弧",场景要体现人物如何更深地陷入这个谎言。不要让人物突然性情大变(OOC),转变必须有具体的场景事件作为触发点。
+
 【构建每个场景必须遵循这个三层顺序,不能跳步或颠倒】
 第一层-情节骨架:这一幕定的情节类型是"${act.plotType || meta.selectedPlots?.join("、") || "不限,你自行判断"}",场景的事件走向要落在这个骨架里(比如骨架是"复仇",场景就该围绕查真相、布局、动手这类节点展开,不能跑去写风花雪月的日常)。
-第二层-叠加爽点:勾选的爽点是"${meta.selectedShuangDian?.join("、") || "未指定"}",把这些爽点安插进上面的情节节点里,决定"这一步的爽感具体从哪里释放"(比如骨架走到"布局"这一步时,用信息差或扮猪吃虎来实现)。
+第二层-叠加爽点:这一幕计划的爽点高潮是"${act.shuangDianMoment || "(未指定,你自行设计一个具体的高潮)"}",必须有至少一个场景把这个爽点落地成具体情节,写清楚"谁做了什么导致了这个爽感"。勾选的爽点类型是"${meta.selectedShuangDian?.join("、") || "未指定"}"。
 第三层-性格微调:最后用人物性格标签决定人物具体怎么做、说什么话。同样的情节+爽点组合,配不同性格的人物,行为方式必须不同。
+
+【伏笔任务(这一幕必须完成,不能省略)】
+这一幕计划的伏笔是: "${act.foreshadowPlan || "(未指定,你自行设计一个)"}",必须有场景明确埋下或回收它。
+${foreshadowLine}
 
 每个场景必须包含8个字段,不能省略:
 - goal(目标) - obstacle(阻碍) - action(人物具体行动,必须由其性格标签驱动,不是为了情节而行动,关系推进方式要符合人物性格,不要默认套用俗套走向)
@@ -533,9 +635,8 @@ async function generateDetailedOutline(charId, actIndex, priorForeshadows = []) 
 - intimacyStage(亲密关系推进到哪一步,只标阶段不写具体内容,取值:"无"/"暧昧"/"肢体接触"/"更进一步"/"回落"之一,推进要循序渐进符合当前关系阶段,不要跳步)
 情感数值节奏: ${buildValueTrendLine(settings)}
 体裁要求: ${meta.selectedGenres?.join("、") || "(未指定)"}${genreDefLines ? `\n体裁定义(严格按此理解):\n${genreDefLines}` : ""}
-${foreshadowLine}
 这一幕内部的节奏也要有张弛(不能从头到尾都是同一种强度)。
-措辞要具体,不要写抽象空洞的模板化描述。
+措辞要具体,不要写抽象空洞的模板化描述,严禁OOC。
 只输出JSON数组,每个元素包含上述8个字段加"scene"(场景序号)。不要输出其他文字。`;
 
     const userPrompt = `人物档案:\n${contextBlock}\n\n当前幕: ${act.title}\n这一幕的情节类型: ${act.plotType || "(未指定)"}\n目标: ${act.goal}\n核心转折: ${act.turn}\n结尾状态: ${act.endState}\n\n请把这一幕拆成4-8个场景的细纲,场景之间要有起伏,不要匀速平铺直叙。`;
@@ -625,7 +726,7 @@ async function realignOutlineWithChat(charId) {
 
 function clearOutline(charId) {
     const settings = ensureSettings();
-    settings.outlines[charId] = { rough: [], detailed: [], meta: {} };
+    settings.outlines[charId] = { rough: [], detailed: [], meta: {}, arc: null };
     saveSettingsDebounced();
 }
 
@@ -734,6 +835,17 @@ async function renderPopupInner() {
     const plotNames = lib.plots.plots.concat(lib.plots.custom_plots || []).map(p => p.name);
     const shuangNames = lib.shuangDian.shuang_dian.concat(lib.shuangDian.custom_shuang_dian || []).map(s => s.name).concat(settings.customShuangDian || []);
 
+    const arcSummaryHtml = store.arc ? `
+        <div class="poa-rough-node" style="border-color:#c77;background:rgba(255,120,120,0.06)">
+            <b>人物弧光设计</b>
+            <div>类型: <span class="poa-editable" contenteditable="true" data-arc-field="arcType">${escapeHtml(store.arc.arcType || "")}</span></div>
+            <div>伤痛: <span class="poa-editable" contenteditable="true" data-arc-field="wound">${escapeHtml(store.arc.wound || "")}</span></div>
+            <div>谎言: <span class="poa-editable" contenteditable="true" data-arc-field="lie">${escapeHtml(store.arc.lie || "")}</span></div>
+            <div>真相: <span class="poa-editable" contenteditable="true" data-arc-field="truth">${escapeHtml(store.arc.truth || "")}</span></div>
+            <div>概述: <span class="poa-editable" contenteditable="true" data-arc-field="arcSummary">${escapeHtml(store.arc.arcSummary || "")}</span></div>
+        </div>
+    ` : "";
+
     const roughRows = store.rough.map((a, i) => `
         <div class="poa-rough-node" data-idx="${i}">
             <div class="poa-rough-head">
@@ -744,6 +856,9 @@ async function renderPopupInner() {
                 </span>
             </div>
             <div>情节类型: <span class="poa-editable" contenteditable="true" data-field="plotType" data-idx="${i}">${escapeHtml(a.plotType || "(未指定)")}</span></div>
+            <div>弧光阶段: <span class="poa-editable" contenteditable="true" data-field="arcStage" data-idx="${i}">${escapeHtml(a.arcStage || "(未指定)")}</span></div>
+            <div>爽点高潮: <span class="poa-editable" contenteditable="true" data-field="shuangDianMoment" data-idx="${i}">${escapeHtml(a.shuangDianMoment || "(未指定)")}</span></div>
+            <div>伏笔计划: <span class="poa-editable" contenteditable="true" data-field="foreshadowPlan" data-idx="${i}">${escapeHtml(a.foreshadowPlan || "(未指定)")}</span></div>
             <div>目标: <span class="poa-editable" contenteditable="true" data-field="goal" data-idx="${i}">${escapeHtml(a.goal)}</span></div>
             <div>转折: <span class="poa-editable" contenteditable="true" data-field="turn" data-idx="${i}">${escapeHtml(a.turn)}</span></div>
             <div>结尾状态: <span class="poa-editable" contenteditable="true" data-field="endState" data-idx="${i}">${escapeHtml(a.endState)}</span></div>
@@ -769,6 +884,11 @@ async function renderPopupInner() {
                 <label>自定义标签(最多凑够${settings.maxTagsTotal}个总数)</label>
                 <div id="poa-custom-tags">${renderTagChips(profile.customTags, true)}</div>
                 <input type="text" id="poa-custom-tag-input" placeholder="输入后回车添加" class="text_pole">
+            </div>
+            <div class="poa-field">
+                <label>User人设(自动读取跨版本不稳定,这里手动确认/编辑,填了就优先用这个)</label>
+                <button class="menu_button" id="poa-detect-persona">尝试自动读取</button>
+                <textarea id="poa-user-persona-text" class="text_pole" rows="4" placeholder="自动读取失败时,把user的人设手动贴在这里">${escapeHtml(settings.userPersonaOverride || "")}</textarea>
             </div>
         </div>
 
@@ -826,7 +946,7 @@ async function renderPopupInner() {
             <button class="menu_button" id="poa-clear-outline" style="background:#a33">清空大纲</button>
             <div id="poa-inject-preview" class="poa-muted" style="white-space:pre-wrap;margin-top:6px"></div>
             <div id="poa-gen-progress" class="poa-muted"></div>
-            <div id="poa-rough-container">${roughRows}</div>
+            <div id="poa-rough-container">${arcSummaryHtml}${roughRows}</div>
         </div>
 
         <div class="poa-tab-panel" data-panel="settings" style="display:none">
@@ -1043,6 +1163,26 @@ function setupGlobalDelegation() {
                 toggleBtn.classList.add("selected");
             } else {
                 toggleBtn.classList.toggle("selected");
+            }
+            return;
+        }
+
+        // 尝试自动读取user人设
+        if (e.target.id === "poa-detect-persona") {
+            toastr.info("正在尝试自动读取...");
+            try {
+                const detected = await attemptAutoDetectUserPersona();
+                if (detected) {
+                    ensureSettings().userPersonaOverride = detected;
+                    saveSettingsDebounced();
+                    toastr.success("读取到了,已填入下方文本框,可以再编辑确认");
+                    await refreshPopup();
+                } else {
+                    toastr.warning("没读取到,可能这个酒馆版本字段不一样,请手动贴到下面的文本框");
+                }
+            } catch (err) {
+                console.error(err);
+                toastr.warning("自动读取失败,请手动填写");
             }
             return;
         }
@@ -1364,6 +1504,7 @@ function setupGlobalDelegation() {
         if (e.target.id === "poa-api-key") { settings.apiKey = e.target.value; saveSettingsDebounced(); }
         else if (e.target.id === "poa-api-base") { settings.apiBaseUrl = e.target.value; saveSettingsDebounced(); }
         else if (e.target.id === "poa-api-model") { settings.apiModel = e.target.value; saveSettingsDebounced(); }
+        else if (e.target.id === "poa-user-persona-text") { settings.userPersonaOverride = e.target.value; saveSettingsDebounced(); }
     });
 
     // ---- blur 事件(可编辑字段保存,blur不冒泡,需要capture) ----
@@ -1372,6 +1513,14 @@ function setupGlobalDelegation() {
         const charId = getCurrentCharId();
         const store = getOutlineStore(charId);
         const field = e.target.dataset.field;
+
+        // 弧光摘要字段(wound/lie/truth/arcType/arcSummary)
+        if (e.target.dataset.arcField) {
+            if (!store.arc) store.arc = {};
+            store.arc[e.target.dataset.arcField] = e.target.textContent;
+            saveSettingsDebounced();
+            return;
+        }
 
         if (e.target.dataset.act !== undefined && e.target.dataset.scene !== undefined) {
             const actIdx = parseInt(e.target.dataset.act, 10);
